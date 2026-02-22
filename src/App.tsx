@@ -6,7 +6,6 @@ import {
   Play, 
   Square, 
   CheckCircle2, 
-  AlertCircle,
   Table,
   PhoneCall,
   Volume2,
@@ -27,7 +26,6 @@ export default function App() {
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [isMuted, setIsMuted] = useState(false);
-  const [status, setStatus] = useState<"idle" | "monitoring" | "error">("idle");
   
   const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -66,7 +64,6 @@ export default function App() {
 
       if (data.type === "error") {
         setIsMonitoring(false);
-        setStatus("error");
         alert(data.message);
       }
     };
@@ -141,7 +138,6 @@ export default function App() {
     }
 
     setIsMonitoring(true);
-    setStatus("monitoring");
     
     wsRef.current?.send(JSON.stringify({ 
       type: "start-monitoring",
@@ -152,7 +148,6 @@ export default function App() {
 
   const stopMonitoring = () => {
     setIsMonitoring(false);
-    setStatus("idle");
     wsRef.current?.send(JSON.stringify({ type: "stop-monitoring" }));
   };
 
