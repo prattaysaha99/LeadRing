@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef } from "react";
-import { io, Socket } from "socket.io-client";
 import { 
   Bell, 
   Settings, 
@@ -11,7 +10,8 @@ import {
   Table,
   PhoneCall,
   Volume2,
-  VolumeX
+  VolumeX,
+  Cloud
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import confetti from "canvas-confetti";
@@ -29,47 +29,55 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const [status, setStatus] = useState<"idle" | "monitoring" | "error">("idle");
   
-  const socketRef = useRef<Socket | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
     checkAuthStatus();
-    
-    // Setup Socket.io
-    socketRef.current = io();
-    
-    socketRef.current.on("new-leads", (data: { leads: string[][], total: number }) => {
-      const newLeads = data.leads.map(row => ({
-        data: row,
-        timestamp: Date.now()
-      }));
-      
-      setLeads(prev => [...newLeads, ...prev].slice(0, 50));
-      
-      if (!isMuted) {
-        playNotification();
-      }
-      
-      confetti({
-        particleCount: 100,
-        spread: 70,
-        origin: { y: 0.6 }
-      });
-    });
+    connectWebSocket();
 
-    socketRef.current.on("monitoring-error", (data: { message: string }) => {
-      setIsMonitoring(false);
-      setStatus("error");
-      alert(data.message);
-    });
-
-    // Cleanup
     return () => {
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
+      if (wsRef.current) wsRef.current.close();
     };
   }, []);
+
+  const connectWebSocket = () => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${protocol}//${window.location.host}`);
+    
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      if (data.type === "new-leads") {
+        const newLeads = data.leads.map((row: string[]) => ({
+          data: row,
+          timestamp: Date.now()
+        }));
+        
+        setLeads(prev => [...newLeads, ...prev].slice(0, 50));
+        if (!isMuted) playNotification();
+        
+        confetti({
+          particleCount: 100,
+          spread: 70,
+          origin: { y: 0.6 }
+        });
+      }
+
+      if (data.type === "error") {
+        setIsMonitoring(false);
+        setStatus("error");
+        alert(data.message);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("WebSocket closed. Reconnecting...");
+      setTimeout(connectWebSocket, 3000);
+    };
+
+    wsRef.current = ws;
+  };
 
   const checkAuthStatus = async () => {
     try {
@@ -118,9 +126,7 @@ export default function App() {
     await fetch("/api/auth/logout", { method: "POST" });
     setAuthenticated(false);
     setIsMonitoring(false);
-    if (socketRef.current) {
-      socketRef.current.emit("stop-monitoring");
-    }
+    wsRef.current?.send(JSON.stringify({ type: "stop-monitoring" }));
   };
 
   const startMonitoring = () => {
@@ -129,7 +135,6 @@ export default function App() {
       return;
     }
     
-    // Extract ID from URL if user pasted the whole link
     let id = spreadsheetId;
     if (id.includes("/d/")) {
       id = id.split("/d/")[1].split("/")[0];
@@ -138,21 +143,17 @@ export default function App() {
     setIsMonitoring(true);
     setStatus("monitoring");
     
-    // We need to pass tokens, but the server has them in session.
-    // However, the socket connection doesn't automatically share the session tokens 
-    // in a way that's easy for the background polling without re-fetching.
-    // For simplicity in this demo, the server will handle session tokens.
-    socketRef.current?.emit("start-monitoring", { 
+    wsRef.current?.send(JSON.stringify({ 
+      type: "start-monitoring",
       spreadsheetId: id,
-      // The server will use the session tokens
-      tokens: "SESSION_TOKENS" 
-    });
+      tokens: "FROM_COOKIE" 
+    }));
   };
 
   const stopMonitoring = () => {
     setIsMonitoring(false);
     setStatus("idle");
-    socketRef.current?.emit("stop-monitoring");
+    wsRef.current?.send(JSON.stringify({ type: "stop-monitoring" }));
   };
 
   const playNotification = () => {
@@ -166,10 +167,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans selection:bg-emerald-100">
-      {/* Audio Element */}
       <audio ref={audioRef} src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" preload="auto" />
 
-      {/* Header */}
       <header className="bg-white border-b border-zinc-200 sticky top-0 z-10">
         <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -180,6 +179,10 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-3">
+            <div className="hidden sm:flex items-center gap-1 px-2 py-1 bg-blue-50 text-blue-600 rounded-lg text-[10px] font-bold uppercase tracking-wider">
+              <Cloud size={12} />
+              Cloudflare Ready
+            </div>
             <button 
               onClick={() => setIsMuted(!isMuted)}
               className="p-2 hover:bg-zinc-100 rounded-lg transition-colors text-zinc-600"
@@ -227,7 +230,6 @@ export default function App() {
           </div>
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            {/* Control Panel */}
             <div className="lg:col-span-1 space-y-6">
               <section className="bg-white p-6 rounded-3xl border border-zinc-200 shadow-sm">
                 <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-6 flex items-center gap-2">
@@ -248,9 +250,6 @@ export default function App() {
                       className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all outline-none text-sm"
                       disabled={isMonitoring}
                     />
-                    <p className="mt-2 text-[10px] text-zinc-400 leading-relaxed">
-                      Tip: Ensure the sheet is accessible to your account. We'll monitor the first sheet for new rows.
-                    </p>
                   </div>
 
                   {!isMonitoring ? (
@@ -281,15 +280,9 @@ export default function App() {
                     {isMonitoring ? 'Active & Listening' : 'System Idle'}
                   </span>
                 </div>
-                {isMonitoring && (
-                  <p className="mt-2 text-xs text-zinc-400">
-                    Polling Google Sheets every 5 seconds...
-                  </p>
-                )}
               </section>
             </div>
 
-            {/* Leads Feed */}
             <div className="lg:col-span-2">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-2xl font-bold flex items-center gap-3">
@@ -320,7 +313,6 @@ export default function App() {
                         <Bell size={32} />
                       </div>
                       <p className="text-zinc-400 font-medium">No leads detected yet.</p>
-                      <p className="text-xs text-zinc-300 mt-1">New leads will appear here in real-time.</p>
                     </motion.div>
                   ) : (
                     leads.map((lead, idx) => (
@@ -342,11 +334,6 @@ export default function App() {
                               </div>
                             </div>
                           </div>
-                          <div className="opacity-0 group-hover:opacity-100 transition-opacity">
-                            <button className="p-1.5 hover:bg-zinc-50 rounded-md text-zinc-400">
-                              <AlertCircle size={14} />
-                            </button>
-                          </div>
                         </div>
                         
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
@@ -366,18 +353,6 @@ export default function App() {
           </div>
         )}
       </main>
-
-      {/* Mobile Bottom Bar (Simulated) */}
-      <div className="sm:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-zinc-200 p-4 flex justify-around items-center">
-        <button className="text-emerald-600 flex flex-col items-center gap-1">
-          <Bell size={20} />
-          <span className="text-[10px] font-bold uppercase">Feed</span>
-        </button>
-        <button className="text-zinc-400 flex flex-col items-center gap-1">
-          <Settings size={20} />
-          <span className="text-[10px] font-bold uppercase">Setup</span>
-        </button>
-      </div>
     </div>
   );
 }

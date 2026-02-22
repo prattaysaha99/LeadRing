@@ -1,39 +1,20 @@
-import express from "express";
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
 import { createServer as createViteServer } from "vite";
-import { Server } from "socket.io";
-import http from "http";
-import path from "path";
+import { WebSocketServer } from "ws";
 import { google } from "googleapis";
-import cookieSession from "cookie-session";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import dotenv from "dotenv";
+import path from "path";
+import http from "http";
 
 dotenv.config();
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
+const app = new Hono();
 const PORT = 3000;
 
-app.use(express.json());
-const sessionMiddleware = cookieSession({
-  name: "session",
-  keys: [process.env.SESSION_SECRET || "leadring-secret"],
-  maxAge: 24 * 60 * 60 * 1000,
-  secure: true,
-  sameSite: "none",
-});
-
-app.use(sessionMiddleware);
-
-// Convert session middleware for socket.io
-io.use((socket, next) => {
-  const req = socket.request as any;
-  const res = {} as any;
-  sessionMiddleware(req, res, () => {
-    next();
-  });
-});
-
+// Google OAuth Client
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -41,7 +22,7 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // Auth Routes
-app.get("/api/auth/url", (req, res) => {
+app.get("/api/auth/url", (c) => {
   const url = oauth2Client.generateAuthUrl({
     access_type: "offline",
     scope: [
@@ -50,15 +31,25 @@ app.get("/api/auth/url", (req, res) => {
     ],
     prompt: "consent",
   });
-  res.json({ url });
+  return c.json({ url });
 });
 
-app.get("/auth/google/callback", async (req, res) => {
-  const { code } = req.query;
+app.get("/auth/google/callback", async (c) => {
+  const code = c.req.query("code");
+  if (!code) return c.text("Missing code", 400);
+
   try {
-    const { tokens } = await oauth2Client.getToken(code as string);
-    (req as any).session.tokens = tokens;
-    res.send(`
+    const { tokens } = await oauth2Client.getToken(code);
+    // Store tokens in a cookie (simplified for Cloudflare compatibility)
+    setCookie(c, "leadring_tokens", JSON.stringify(tokens), {
+      path: "/",
+      secure: true,
+      httpOnly: true,
+      sameSite: "None",
+      maxAge: 60 * 60 * 24, // 1 day
+    });
+
+    return c.html(`
       <html>
         <body>
           <script>
@@ -75,33 +66,30 @@ app.get("/auth/google/callback", async (req, res) => {
     `);
   } catch (error) {
     console.error("Error exchanging code for tokens:", error);
-    res.status(500).send("Authentication failed");
+    return c.text("Authentication failed", 500);
   }
 });
 
-app.get("/api/auth/status", (req, res) => {
-  res.json({ authenticated: !!(req as any).session?.tokens });
+app.get("/api/auth/status", (c) => {
+  const tokens = getCookie(c, "leadring_tokens");
+  return c.json({ authenticated: !!tokens });
 });
 
-app.post("/api/auth/logout", (req, res) => {
-  (req as any).session = null;
-  res.json({ success: true });
+app.post("/api/auth/logout", (c) => {
+  deleteCookie(c, "leadring_tokens");
+  return c.json({ success: true });
 });
 
 // Lead Monitoring Logic
-const activeMonitors = new Map<string, NodeJS.Timeout>();
-
 async function checkLeads(tokens: any, spreadsheetId: string) {
   try {
     const auth = new google.auth.OAuth2();
     auth.setCredentials(tokens);
     const sheets = google.sheets({ version: "v4", auth });
-
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range: "A:Z",
     });
-
     return response.data.values || [];
   } catch (error) {
     console.error("Error checking leads:", error);
@@ -109,81 +97,83 @@ async function checkLeads(tokens: any, spreadsheetId: string) {
   }
 }
 
-io.on("connection", (socket) => {
-  const session = (socket.request as any).session;
-  console.log("Client connected:", socket.id, "Authenticated:", !!session?.tokens);
+// Start Node Server
+const server = serve({
+  fetch: app.fetch,
+  port: PORT,
+});
 
-  socket.on("start-monitoring", async ({ spreadsheetId }) => {
-    if (!spreadsheetId || !session?.tokens) {
-      console.log("Monitoring failed: missing ID or tokens");
-      return;
-    }
+// Setup WebSockets (Node.js version)
+const wss = new WebSocketServer({ server: server as any });
 
-    console.log(`Starting monitor for ${socket.id} on ${spreadsheetId}`);
-    
-    let lastRowCount = -1;
+wss.on("connection", (ws) => {
+  console.log("Client connected to WebSocket");
+  let monitorInterval: NodeJS.Timeout | null = null;
 
-    // Initial check to set baseline
-    const initialRows = await checkLeads(session.tokens, spreadsheetId);
-    if (initialRows === null) {
-      socket.emit("monitoring-error", { message: "Failed to access spreadsheet. Check the ID and permissions." });
-      return;
-    }
-    lastRowCount = initialRows.length;
+  ws.on("message", async (message) => {
+    const data = JSON.parse(message.toString());
 
-    const interval = setInterval(async () => {
-      const rows = await checkLeads(session.tokens, spreadsheetId);
-      if (rows) {
-        if (lastRowCount !== -1 && rows.length > lastRowCount) {
-          const newLeads = rows.slice(lastRowCount);
-          socket.emit("new-leads", { leads: newLeads, total: rows.length });
-        }
-        lastRowCount = rows.length;
-      } else {
-        socket.emit("monitoring-error", { message: "Lost connection to spreadsheet." });
-        clearInterval(interval);
-        activeMonitors.delete(socket.id);
+    if (data.type === "start-monitoring") {
+      const { spreadsheetId, tokens } = data;
+      if (!spreadsheetId || !tokens) return;
+
+      console.log(`Monitoring started for ${spreadsheetId}`);
+      let lastRowCount = -1;
+
+      const initialRows = await checkLeads(tokens, spreadsheetId);
+      if (initialRows === null) {
+        ws.send(JSON.stringify({ type: "error", message: "Failed to access spreadsheet." }));
+        return;
       }
-    }, 5000);
+      lastRowCount = initialRows.length;
 
-    activeMonitors.set(socket.id, interval);
-  });
+      monitorInterval = setInterval(async () => {
+        const rows = await checkLeads(tokens, spreadsheetId);
+        if (rows) {
+          if (lastRowCount !== -1 && rows.length > lastRowCount) {
+            const newLeads = rows.slice(lastRowCount);
+            ws.send(JSON.stringify({ type: "new-leads", leads: newLeads }));
+          }
+          lastRowCount = rows.length;
+        } else {
+          ws.send(JSON.stringify({ type: "error", message: "Lost connection to spreadsheet." }));
+          if (monitorInterval) clearInterval(monitorInterval);
+        }
+      }, 5000);
+    }
 
-  socket.on("stop-monitoring", () => {
-    const interval = activeMonitors.get(socket.id);
-    if (interval) {
-      clearInterval(interval);
-      activeMonitors.delete(socket.id);
+    if (data.type === "stop-monitoring") {
+      if (monitorInterval) clearInterval(monitorInterval);
     }
   });
 
-  socket.on("disconnect", () => {
-    const interval = activeMonitors.get(socket.id);
-    if (interval) {
-      clearInterval(interval);
-      activeMonitors.delete(socket.id);
-    }
-    console.log("Client disconnected:", socket.id);
+  ws.on("close", () => {
+    if (monitorInterval) clearInterval(monitorInterval);
+    console.log("Client disconnected");
   });
 });
 
-async function startServer() {
+// Vite Integration for Dev
+async function setupVite() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
+    // Use Hono's middleware to wrap Vite
+    app.use("*", async (c, next) => {
+      return new Promise((resolve) => {
+        vite.middlewares(c.req.raw as any, c.res as any, () => {
+          resolve(next());
+        });
+      });
     });
+  } else {
+    app.use("/assets/*", serveStatic({ root: "./dist" }));
+    app.get("*", serveStatic({ path: "./dist/index.html" }));
   }
-
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
 }
 
-startServer();
+setupVite();
+
+console.log(`Server running on http://localhost:${PORT}`);
