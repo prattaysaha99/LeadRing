@@ -1,0 +1,5 @@
+{
+  "name": "LeadRing",
+  "description": "Real-time Google Sheets lead notification app. Rings your phone when a new lead arrives.",
+  "requestFramePermissions": []
+}
